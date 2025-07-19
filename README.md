@@ -1,4 +1,4 @@
-# Parsing
+# Anti-Bot-HTTP-Tool
 ## 🤖 Anti-Bot Evasion Tool in Go
 
 [cite_start]This is a custom HTTPS tool built in Go, designed to fly under the radar of tough anti-bot systems like Cloudflare, PerimeterX, and Akamai[cite: 3]. It works by carefully imitating a real web browser, from its TLS handshake down to its HTTP headers.
