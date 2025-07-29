@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	
 	"fmt"
 	"io"
 	"log"
@@ -17,24 +16,30 @@ import (
 	"time"
 
 	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/proxy"
 	"gopkg.in/yaml.v3"
 )
 
 // --- Configuration Structs ---
 
+// Config holds all configuration from the yaml file.
 type Config struct {
 	Targets  []string `yaml:"targets"`
 	Proxies  []string `yaml:"proxies"`
 	Settings Settings `yaml:"settings"`
 }
 
+// Settings define the operational parameters for requests.
 type Settings struct {
-	RequestCount int    `yaml:"request_count"`
-	MaxRetries   int    `yaml:"max_retries"`
-	TlsProfile   string `yaml:"tls_profile"`
-	Delay        Delay  `yaml:"delay_ms"`
+	RequestCount  int               `yaml:"request_count"`
+	MaxRetries    int               `yaml:"max_retries"`
+	TlsProfile    string            `yaml:"tls_profile"`
+	UseCookies    bool              `yaml:"use_cookies"`
+	CustomHeaders map[string]string `yaml:"custom_headers"`
+	Delay         Delay             `yaml:"delay_ms"`
 }
 
+// Delay specifies the min/max wait time between requests.
 type Delay struct {
 	Min int `yaml:"min"`
 	Max int `yaml:"max"`
@@ -42,26 +47,37 @@ type Delay struct {
 
 // --- Proxy Manager ---
 
+// ProxyInfo stores details for a single proxy.
+type ProxyInfo struct {
+	URL    *url.URL
+	Scheme string
+}
+
+// ProxyManager handles thread-safe, round-robin proxy rotation.
 type ProxyManager struct {
-	proxies []*url.URL
+	proxies []ProxyInfo
 	index   int
 	mutex   sync.Mutex
 }
 
-// NewProxyManager creates and initializes a proxy manager.
+// NewProxyManager creates and initializes a proxy manager, parsing and validating proxy strings.
 func NewProxyManager(proxyStrings []string) (*ProxyManager, error) {
 	if len(proxyStrings) == 0 {
 		return nil, fmt.Errorf("proxy list cannot be empty")
 	}
 
-	proxies := make([]*url.URL, 0, len(proxyStrings))
+	proxies := make([]ProxyInfo, 0, len(proxyStrings))
 	for _, pStr := range proxyStrings {
-		parsedURL, err := url.Parse(fmt.Sprintf("http://%s", pStr))
+		// Default to http scheme if not specified for backward compatibility
+		if !strings.Contains(pStr, "://") {
+			pStr = "http://" + pStr
+		}
+		parsedURL, err := url.Parse(pStr)
 		if err != nil {
-			log.Printf("Warning: Skipping invalid proxy '%s': %v", pStr, err)
+			log.Printf("Warning: Skipping invalid proxy URL '%s': %v", pStr, err)
 			continue
 		}
-		proxies = append(proxies, parsedURL)
+		proxies = append(proxies, ProxyInfo{URL: parsedURL, Scheme: parsedURL.Scheme})
 	}
 
 	if len(proxies) == 0 {
@@ -71,8 +87,8 @@ func NewProxyManager(proxyStrings []string) (*ProxyManager, error) {
 	return &ProxyManager{proxies: proxies}, nil
 }
 
-// GetNextProxy rotates proxies in a round-robin fashion.
-func (pm *ProxyManager) GetNextProxy() *url.URL {
+// GetNextProxy safely rotates to the next proxy.
+func (pm *ProxyManager) GetNextProxy() ProxyInfo {
 	pm.mutex.Lock()
 	defer pm.mutex.Unlock()
 
@@ -84,14 +100,13 @@ func (pm *ProxyManager) GetNextProxy() *url.URL {
 // --- TLS Profile & Header Definitions ---
 
 var (
-	// Map human-readable names to uTLS ClientHelloID
+	// browserProfiles maps readable names to uTLS ClientHelloIDs.
 	browserProfiles = map[string]utls.ClientHelloID{
 		"chrome":  utls.HelloChrome_120,
 		"firefox": utls.HelloFirefox_120,
 		"safari":  utls.HelloSafari_16_0,
 	}
-
-	// Map ClientHelloID to a consistent set of browser headers
+	// browserHeaders maps ClientHelloIDs to consistent browser headers.
 	browserHeaders = map[utls.ClientHelloID]http.Header{
 		utls.HelloChrome_120: {
 			"sec-ch-ua":                 {`"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"`},
@@ -123,31 +138,24 @@ var (
 			"accept":          {`text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8`},
 			"accept-language": {`en-US,en;q=0.9`},
 			"accept-encoding": {`gzip, deflate, br`},
-			"sec-fetch-dest":  {`document`},
-			"sec-fetch-mode":  {`Maps`},
-			"sec-fetch-site":  {`none`},
-			"sec-fetch-user":  {`?1`},
 		},
 	}
 )
 
-// selectClientProfile randomly selects a profile if "random" is specified.
+// selectClientProfile chooses a TLS fingerprint and matching headers, randomizing if requested.
 func selectClientProfile(profileName string) (utls.ClientHelloID, http.Header) {
 	profileName = strings.ToLower(profileName)
-
 	if profileName == "random" {
 		keys := make([]utls.ClientHelloID, 0, len(browserHeaders))
 		for k := range browserHeaders {
 			keys = append(keys, k)
 		}
 		selectedKey := keys[rand.Intn(len(keys))]
-		return selectedKey, browserHeaders[selectedKey]
+		return selectedKey, browserHeaders[selectedKey].Clone() // Clone to prevent race conditions
 	}
-
 	if profile, ok := browserProfiles[profileName]; ok {
-		return profile, browserHeaders[profile]
+		return profile, browserHeaders[profile].Clone()
 	}
-
 	log.Printf("Warning: Unknown profile '%s', defaulting to random.", profileName)
 	return selectClientProfile("random")
 }
@@ -155,79 +163,101 @@ func selectClientProfile(profileName string) (utls.ClientHelloID, http.Header) {
 // --- Core Logic ---
 
 func main() {
-	// Step 1: Load Configuration from YAML
+	// 1. Load Configuration
 	configFile, err := os.ReadFile("config.yaml")
 	if err != nil {
 		log.Fatalf("Error reading config.yaml: %v", err)
 	}
-
 	var config Config
 	if err := yaml.Unmarshal(configFile, &config); err != nil {
 		log.Fatalf("Error parsing config.yaml: %v", err)
 	}
 
-	// Step 2: Initialize Proxy Manager
+	// 2. Initialize Proxy Manager
 	proxyManager, err := NewProxyManager(config.Proxies)
 	if err != nil {
 		log.Fatalf("Failed to initialize proxy manager: %v", err)
 	}
 	log.Printf("Successfully loaded %d proxies.", len(proxyManager.proxies))
 
-	// Step 3: Main Request Loop
-	jar, _ := cookiejar.New(nil)
-	successCount := 0
+	// 3. Setup Session (Cookie Jar)
+	var jar http.CookieJar
+	if config.Settings.UseCookies {
+		jar, _ = cookiejar.New(nil)
+	}
 
+	// 4. Main Request Loop
+	successCount := 0
 	for successCount < config.Settings.RequestCount {
 		targetURL := config.Targets[rand.Intn(len(config.Targets))]
 		var resp *http.Response
-		var ja3 string
-		var finalProxy string
+		var ja3, finalProxyHost string
 
-		// Step 4: Retry Logic Loop
+		// 5. Retry Logic Loop
 		for i := 0; i < config.Settings.MaxRetries; i++ {
-			proxyURL := proxyManager.GetNextProxy()
-			finalProxy = proxyURL.Host // For logging
+			proxyInfo := proxyManager.GetNextProxy()
+			finalProxyHost = proxyInfo.URL.Host
 
-			// Select a new TLS fingerprint and header set for each attempt
+			// Select new identity for each attempt
 			clientProfile, headers := selectClientProfile(config.Settings.TlsProfile)
+			for key, val := range config.Settings.CustomHeaders {
+				headers.Set(key, val)
+			}
 
-			// Create a uTLS-powered HTTP client
+			// Create a uTLS-powered HTTP client with proxy support
 			client := &http.Client{
-				Jar: jar, // Manage cookies and redirects across session
+				Jar: jar,
 				Transport: &http.Transport{
-					Proxy: http.ProxyURL(proxyURL),
-					// Inside the http.Transport struct
-					DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-    					dialer := &net.Dialer{Timeout: 30 * time.Second}
-    					tcpConn, err := dialer.DialContext(ctx, network, addr)
-    					if err != nil {
-        					return nil, err
-    					}
+					// This function dials the proxy and wraps the connection with uTLS
+					DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+						var dialer proxy.Dialer = &net.Dialer{Timeout: 30 * time.Second}
+						var conn net.Conn
+						var err error
 
-    					config := &utls.Config{ServerName: strings.Split(addr, ":")[0]}
-    					uTLSConn := utls.UClient(tcpConn, config, clientProfile)
+						// Dial through the appropriate proxy type
+						switch proxyInfo.Scheme {
+						case "socks5":
+							var auth *proxy.Auth
+							if user := proxyInfo.URL.User; user != nil {
+								password, _ := user.Password()
+								auth = &proxy.Auth{User: user.Username(), Password: password}
+							}
+							dialer, err = proxy.SOCKS5("tcp", proxyInfo.URL.Host, auth, dialer)
+							if err != nil {
+								return nil, fmt.Errorf("failed to create socks5 dialer: %w", err)
+							}
+							conn, err = dialer.(proxy.ContextDialer).DialContext(ctx, network, addr)
+						default: // http/https
+							conn, err = dialer.Dial(network, addr)
+						}
+						if err != nil {
+							return nil, fmt.Errorf("proxy dial failed: %w", err)
+						}
 
-    					if err := uTLSConn.HandshakeContext(ctx); err != nil {
-        					return nil, fmt.Errorf("uTLS handshake failed: %w", err)
-    					}
+						// Wrap the connection with uTLS
+						config := &utls.Config{ServerName: strings.Split(addr, ":")[0]}
+						uTLSConn := utls.UClient(conn, config, clientProfile)
 
-    					var ja3Err error
-    					ja3, ja3Err = uTLSConn.JA3()
-    					if ja3Err != nil {
-        					// The handshake succeeded, but we couldn't get the JA3.
-        					// Log it as a warning but don't fail the whole request.
-        					log.Printf("Warning: Could not get JA3 hash: %v", ja3Err)
-    					}
-
-    					return uTLSConn, nil
+						if err := uTLSConn.HandshakeContext(ctx); err != nil {
+							return nil, fmt.Errorf("uTLS handshake failed: %w", err)
+						}
+						ja3 = "unavailable"
+						// Log the JA3 hash but don't fail the request if it's unavailable
+						//ja3, _ = uTLSConn.JA3()
+						return uTLSConn, nil
 					},
-					// Add a timeout for the entire request including response
+					Proxy:                 http.ProxyURL(proxyInfo.URL), // Only used for http/https proxies
 					ResponseHeaderTimeout: 30 * time.Second,
 				},
-				// Stop client from following redirects automatically so we can log them
+				// Disable automatic redirects to handle them manually
 				CheckRedirect: func(req *http.Request, via []*http.Request) error {
 					return http.ErrUseLastResponse
 				},
+			}
+
+			// For SOCKS5, the transport's Proxy field must be nil
+			if proxyInfo.Scheme == "socks5" {
+				client.Transport.(*http.Transport).Proxy = nil
 			}
 
 			// Create and send the request
@@ -236,107 +266,83 @@ func main() {
 
 			resp, err = client.Do(req)
 			if err != nil {
-				log.Printf("[ATTEMPT %d/%d] FAILED (Proxy: %s): Request error: %v", i+1, config.Settings.MaxRetries, finalProxy, err)
-				time.Sleep(1 * time.Second) // Wait a bit before retrying
+				log.Printf("[ATTEMPT %d/%d] FAILED (Proxy: %s): Request error: %v", i+1, config.Settings.MaxRetries, finalProxyHost, err)
+				time.Sleep(1 * time.Second)
 				continue
 			}
 
-			// Step 5: Analyze Response
+			// 6. Analyze Response
 			status := analyzeResponse(resp)
-			log.Printf("[ATTEMPT %d/%d] STATUS: %s | URL: %s | PROXY: %s | JA3: %s", i+1, config.Settings.MaxRetries, status, targetURL, finalProxy, ja3)
+			log.Printf("[ATTEMPT %d/%d] STATUS: %s | URL: %s | PROXY: %s | JA3: %s", i+1, config.Settings.MaxRetries, status, targetURL, finalProxyHost, ja3)
 
 			if status == "SUCCESS" {
-				break // Exit retry loop on success
+				break // Exit retry loop
 			}
 
-			// Handle redirects manually
-			// Handle redirects manually
+			// Handle redirects manually to maintain control
 			if status == "REDIRECT" {
-    			locationHeader := resp.Header.Get("Location")
-    			if locationHeader == "" {
-        			log.Printf("[ATTEMPT %d/%d] FAILED: Redirect status but no Location header.", i+1, config.Settings.MaxRetries)
-        			resp.Body.Close()
-        			continue // Treat as a failed attempt
-    			}
-
-    			redirectURL, err := resp.Request.URL.Parse(locationHeader)
-    			if err != nil {
-        			log.Printf("[ATTEMPT %d/%d] FAILED: Could not parse redirect URL '%s'", i+1, config.Settings.MaxRetries, locationHeader)
-        			resp.Body.Close()
-        			continue // Treat as a failed attempt
-    			}
-    
-    			// This correctly resolves the redirect URL
-    			targetURL = redirectURL.String()
-
-    			log.Printf("--> Redirecting to: %s", targetURL)
-    			i = -1 // Reset retry counter for the new URL
-    			resp.Body.Close()
-    			continue
+				locationHeader := resp.Header.Get("Location")
+				if locationHeader == "" {
+					log.Printf("[ATTEMPT %d/%d] FAILED: Redirect status but no Location header.", i+1, config.Settings.MaxRetries)
+				} else if newURL, err := resp.Request.URL.Parse(locationHeader); err != nil {
+					log.Printf("[ATTEMPT %d/%d] FAILED: Could not parse redirect URL '%s'", i+1, config.Settings.MaxRetries, locationHeader)
+				} else {
+					targetURL = newURL.String()
+					log.Printf("--> Redirecting to: %s", targetURL)
+					i = -1 // Reset retry counter for the new URL
+				}
+				resp.Body.Close()
+				continue
 			}
 
 			// If blocked or failed, the loop will continue to the next retry
 			resp.Body.Close()
 		}
 
-		// Check final status after retries
+		// Check final status after all retries
 		if resp != nil {
-			finalStatus := analyzeResponse(resp)
-			if finalStatus == "SUCCESS" {
+			if analyzeResponse(resp) == "SUCCESS" {
 				successCount++
 				log.Printf("--- SUCCESS (%d/%d) ---", successCount, config.Settings.RequestCount)
-				// You can process the successful response body here if needed
-				// body, _ := io.ReadAll(resp.Body)
-				// fmt.Println(string(body[:100])) // Print first 100 chars
-
 			} else {
 				log.Printf("--- FAILED after %d retries ---", config.Settings.MaxRetries)
 			}
 			resp.Body.Close()
 		}
 
-		// Step 6: Randomized Delay
+		// 7. Randomized Delay
 		if successCount < config.Settings.RequestCount {
 			delay := rand.Intn(config.Settings.Delay.Max-config.Settings.Delay.Min+1) + config.Settings.Delay.Min
 			log.Printf("Waiting for %dms...", delay)
 			time.Sleep(time.Duration(delay) * time.Millisecond)
 		}
 	}
-
 	log.Printf("Completed %d successful requests. Exiting.", config.Settings.RequestCount)
 }
 
-// analyzeResponse categorizes the HTTP response.
+// analyzeResponse categorizes the HTTP response status.
 func analyzeResponse(resp *http.Response) string {
-	// Redirects
+	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+		return "SUCCESS"
+	}
 	if resp.StatusCode >= 300 && resp.StatusCode <= 399 {
 		return "REDIRECT"
 	}
-
-	// Blocked/Challenged
 	if resp.StatusCode == 403 || resp.StatusCode == 429 {
 		return "BLOCKED"
 	}
 
-	// Check body for common challenge keywords
+	// Read body to check for challenge keywords without consuming it
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err == nil {
-		bodyString := string(bodyBytes)
-		// Restore body for further processing
-		resp.Body = io.NopCloser(strings.NewReader(bodyString))
-
+		resp.Body = io.NopCloser(strings.NewReader(string(bodyBytes))) // Restore body
+		bodyString := strings.ToLower(string(bodyBytes))
 		challengeWords := []string{"captcha", "challenge", "verify you are human", "are you a robot"}
 		for _, word := range challengeWords {
-			if strings.Contains(strings.ToLower(bodyString), word) {
+			if strings.Contains(bodyString, word) {
 				return "BLOCKED"
 			}
 		}
 	}
-
-	// Success
-	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
-		return "SUCCESS"
-	}
-
 	return fmt.Sprintf("FAILED_HTTP_%d", resp.StatusCode)
 }
