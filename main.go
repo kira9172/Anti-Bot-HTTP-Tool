@@ -18,6 +18,7 @@ import (
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/proxy"
 	"gopkg.in/yaml.v3"
+	
 )
 
 // --- Configuration Structs ---
@@ -160,6 +161,8 @@ func selectClientProfile(profileName string) (utls.ClientHelloID, http.Header) {
 	return selectClientProfile("random")
 }
 
+
+
 // --- Core Logic ---
 
 func main() {
@@ -237,13 +240,13 @@ func main() {
 						// Wrap the connection with uTLS
 						config := &utls.Config{ServerName: strings.Split(addr, ":")[0]}
 						uTLSConn := utls.UClient(conn, config, clientProfile)
-
+						
 						if err := uTLSConn.HandshakeContext(ctx); err != nil {
 							return nil, fmt.Errorf("uTLS handshake failed: %w", err)
 						}
-						ja3 = "unavailable"
+
 						// Log the JA3 hash but don't fail the request if it's unavailable
-						//ja3, _ = uTLSConn.JA3()
+						ja3 = uTLSConn.HandshakeState.JA3
 						return uTLSConn, nil
 					},
 					Proxy:                 http.ProxyURL(proxyInfo.URL), // Only used for http/https proxies
