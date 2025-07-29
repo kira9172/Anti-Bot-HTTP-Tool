@@ -5,8 +5,9 @@
 *.so
 *.dylib
 
-# Project-specific binary (for Linux/macOS)
+# Project-specific binaries
 anti-bot-tool
+anti-bot-tool.exe
 
 # Test binary, built with `go test -c`
 *.test
@@ -17,14 +18,12 @@ coverage.*
 *.coverprofile
 profile.cov
 
-# Dependency directories (uncomment to ignore)
-# vendor/
-
 # Go workspace file
 go.work
 go.work.sum
 
-# Environment variable file
+# Local configuration and environment variables
+config.yaml
 .env
 
 # Editor/IDE specific folders (uncomment as needed)
